@@ -4,7 +4,7 @@ A native macOS desktop streamed into a Three.js/WebXR workspace. This is a worki
 
 [Open the live dashboard](https://jennifer-applications-ghz-occurs.trycloudflare.com). This temporary HTTPS deployment serves the real pairing API and WebSocket service from the development Mac. It stays online only while that Mac and its tunnel are running, and its URL changes on restart. Desktop access requires a pairing code and explicit Mac approval. Streaming currently requires the headset and Mac on a reachable local network. See [hosting and restart instructions](docs/HOSTING.md).
 
-**Verified during local development:** ScreenCaptureKit → native libwebrtc → Chrome video, 1920 × 1242, direct peer, an observed 8 ms round-trip time on loopback. That figure is not Quest latency or motion-to-photon latency. Quest 2 testing, current H.264 capture/input verification and durable hosting remain release gates. See [the verification record](docs/VERIFICATION.md) and [the roadmap](ROADMAP.md).
+**Verified during local development:** the public HTTPS dashboard paired with the signed Mac host and received real ScreenCaptureKit → H.264/WebRTC → Chrome video at 1112 × 720. Browser statistics showed 30 fps, approximately 0.3 Mbps and 1 ms round-trip time over a direct local peer connection. These are observed snapshots, not sustained-performance, Quest-latency or motion-to-photon measurements. Quest 2 testing, input verification, measured encoding hardware utilization and durable hosting remain release gates. See [the verification record](docs/VERIFICATION.md) and [the roadmap](ROADMAP.md).
 
 You can also launch the local server and companion with `scripts/start-local.command` after dependencies are installed.
 
@@ -30,7 +30,13 @@ open "artifacts/DeskDeck Host.app" --args --config "$PWD/.data/host.json"
 
 The launch argument imports the local host credential into macOS Keychain. Subsequent launches remember it. Alternatively use **Import server config** in the app. The host shows a QR code for the website and a two-minute six-digit pairing code. Enable Screen Recording and Accessibility with its two permission buttons; relaunch if macOS requests it. No microphone or Input Monitoring permission is requested.
 
-The bundled app is **ad-hoc signed for local development**. Distribution requires your Apple Developer ID, hardened-runtime testing, notarization and a stable signing identity. Rebuilding with a different signing identity can require granting permissions again. `scripts/build-host.sh` uses the installed Xcode without changing global `xcode-select` settings.
+By default the app is **ad-hoc signed for local development**. To preserve a consistent identity across local rebuilds, use an existing Apple Development signing identity from `security find-identity -v -p codesigning`:
+
+```bash
+CODE_SIGN_IDENTITY="YOUR_SIGNING_IDENTITY_HASH" npm run host:build
+```
+
+Distribution still requires Apple Developer ID signing, hardened-runtime testing and notarization. Ad-hoc rebuilds and changes of signing identity can invalidate existing macOS grants even when their switches remain on. If that happens, remove **only DeskDeck Host** from Screen & System Audio Recording and Accessibility, add the current app from `artifacts/DeskDeck Host.app` back to each list, enable it, and quit/reopen the host. Merely toggling the stale entry may retain its old code requirement. `scripts/build-host.sh` uses the installed Xcode without changing global `xcode-select` settings.
 
 ## Connect from Quest (trusted HTTPS required)
 
@@ -77,7 +83,7 @@ The dashboard has real connection state, app launching (allowlisted installed ap
 - `web/app`: responsive React control interface.
 - `tests`: protocol/security tests, browser flows and opt-in native smoke test.
 
-H.264 is prioritized in negotiation, using WebRTC's Apple encoder path (VideoToolbox where available); actual codec is shown in Connection. Encoding hardware utilization must be measured on each supported Mac. Capture targets a 1920-pixel-wide display at up to 60 fps, preserving its actual aspect ratio. ScreenCaptureKit suppresses unchanged frames, so an idle desktop can report fewer fps. WebRTC provides congestion control; manual quality presets and 72/90 fps tuning are later work. Do not infer these from Quest's display refresh rate.
+H.264 is prioritized in negotiation, using WebRTC's Apple encoder path (VideoToolbox where available); actual codec is shown in Connection. Encoding hardware utilization must be measured on each supported Mac. Capture fits within 1280 × 720 at up to 30 fps, preserving the display's aspect ratio and using even pixel dimensions. This matches the bundled encoder's advertised H.264 level 3.1; larger frames caused VideoToolbox encoding failure. ScreenCaptureKit suppresses unchanged frames, so an idle desktop can report fewer fps. WebRTC provides congestion control; higher-resolution codec negotiation, manual quality presets and 72/90 fps tuning are later work. Do not infer these from Quest's display refresh rate.
 
 ## Verification
 

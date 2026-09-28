@@ -13,7 +13,7 @@ struct Device: Identifiable {let id:String;let name:String}
     @Published var approval:(id:String,name:String)?
     @Published var devices:[Device]=[]
     @Published var error=""
-    var config:HostConfig?;var socket:URLSessionWebSocketTask?;var peer:DesktopPeer?;var session="";var reconnect:Task<Void,Never>?
+    var config:HostConfig?;var socket:URLSessionWebSocketTask?;var peer:DesktopPeer?;var session="";var activePeerID:UUID?;var reconnect:Task<Void,Never>?
     init() {
         if let index=CommandLine.arguments.firstIndex(of:"--config"),CommandLine.arguments.count>index+1 {
             do { let data=try Data(contentsOf:URL(fileURLWithPath:CommandLine.arguments[index+1]));let c=try JSONDecoder().decode(HostConfig.self,from:data)
@@ -41,7 +41,7 @@ struct Device: Identifiable {let id:String;let name:String}
         ws.receive { [weak self] result in Task { @MainActor in
             guard let self=self,self.socket===ws else{return}
             switch result {
-            case .failure(let e):self.status="Server unavailable";self.error=e.localizedDescription;self.code="------";self.peer?.stop();self.peer=nil;self.reconnect?.cancel();self.reconnect=Task{try? await Task.sleep(for:.seconds(3));if !Task.isCancelled{self.connect()}}
+            case .failure(let e):self.stopPeer();self.status="Server unavailable";self.error=e.localizedDescription;self.code="------";self.reconnect?.cancel();self.reconnect=Task{try? await Task.sleep(for:.seconds(3));if !Task.isCancelled{self.connect()}}
             case .success(let message):
                 let d:Data;switch message{case .data(let value):d=value;case .string(let s):d=Data(s.utf8);@unknown default:return}
                 if let m=(try? JSONSerialization.jsonObject(with:d)) as? [String:Any] {await self.handle(m)};self.receive(ws)
@@ -53,20 +53,22 @@ struct Device: Identifiable {let id:String;let name:String}
         case "code":code=m["code"] as? String ?? "------";if peer==nil {status="Ready to connect"};devices=(m["devices"] as? [[String:Any]] ?? []).compactMap{d in guard let id=d["id"] as? String,let name=d["name"] as? String else{return nil};return Device(id:id,name:name)}
         case "approval":if let id=m["id"] as? String,let name=m["name"] as? String {approval=(id,name);NSApp.activate(ignoringOtherApps:true)}
         case "start":
-            peer?.stop();session=m["session"] as? String ?? "";status="Starting desktop capture…"
-            guard CGPreflightScreenCaptureAccess(),AXIsProcessTrusted() else {send(["type":"error","session":session,"message":"Enable Screen Recording and Accessibility in DeskDeck Host."]);status="Permissions needed";return}
-            let sid=session
-            let p=DesktopPeer(signal:{[weak self] value in Task{@MainActor in var v=value;v["session"]=sid;self?.send(v)}},state:{[weak self] s in Task{@MainActor in self?.status=s=="connected" ? "Headset connected" : s}});peer=p
-            do{try await p.start()}catch{self.error=error.localizedDescription;send(["type":"error","session":sid,"message":error.localizedDescription]);p.stop();peer=nil}
+            stopPeer();error="";session=m["session"] as? String ?? "";status="Starting desktop capture…"
+            guard CGPreflightScreenCaptureAccess() else {error="Screen Recording is not authorized for this DeskDeck Host build. Allow it in System Settings, then quit and reopen DeskDeck Host.";send(["type":"error","session":session,"message":error]);status="Screen Recording permission needed";return}
+            guard AXIsProcessTrusted() else {error="Accessibility is not authorized for this DeskDeck Host build. Allow DeskDeck Host in System Settings → Privacy & Security → Accessibility.";send(["type":"error","session":session,"message":error]);status="Accessibility permission needed";return}
+            let sid=session,id=UUID();activePeerID=id
+            let p=DesktopPeer(signal:{[weak self] value in Task{@MainActor in guard let self=self,self.activePeerID==id,self.session==sid,self.peer != nil else{return};var v=value;v["session"]=sid;self.send(v)}},state:{[weak self] s in Task{@MainActor in guard let self=self,self.activePeerID==id,self.session==sid,self.peer != nil else{return};self.status=s}});peer=p
+            do{try await p.start()}catch{guard peer===p,session==sid else{return};self.error=error.localizedDescription;send(["type":"error","session":sid,"message":error.localizedDescription]);stopPeer();status="Desktop capture failed"}
         case "offer","ice":if m["session"] as? String==session {peer?.receive(m)}
-        case "stop":peer?.stop();peer=nil;status="Ready to connect"
+        case "stop":stopPeer();error="";status="Ready to connect"
         default:break
         }
     }
     func approve(_ allow:Bool) {if let a=approval{send(["type":"approval","id":a.id,"allow":allow])};approval=nil}
     func screenPermission() {CGRequestScreenCaptureAccess();NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)}
     func inputPermission() {let options=[kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary;_ = AXIsProcessTrustedWithOptions(options)}
-    func disconnect() {peer?.stop();peer=nil;send(["type":"disconnect"]);status="Ready to connect"}
+    private func stopPeer() {let p=peer;peer=nil;activePeerID=nil;session="";p?.stop()}
+    func disconnect() {stopPeer();error="";send(["type":"disconnect"]);status="Ready to connect"}
     private func loadSecret()->Data? {var item:CFTypeRef?;let q:[String:Any]=[kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:"DeskDeckHost",kSecAttrAccount as String:"server",kSecReturnData as String:true];return SecItemCopyMatching(q as CFDictionary,&item)==errSecSuccess ? item as? Data:nil}
     private func saveSecret(_ data:Data)throws {let q:[String:Any]=[kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:"DeskDeckHost",kSecAttrAccount as String:"server"];SecItemDelete(q as CFDictionary);var a=q;a[kSecValueData as String]=data;a[kSecAttrAccessible as String]=kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;let s=SecItemAdd(a as CFDictionary,nil);if s != errSecSuccess{throw NSError(domain:NSOSStatusErrorDomain,code:Int(s))}}
 }

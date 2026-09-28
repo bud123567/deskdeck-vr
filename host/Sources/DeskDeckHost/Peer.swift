@@ -5,24 +5,36 @@ import ScreenCaptureKit
 import WebRTC
 import CoreMedia
 
+private let desktopDiagnosticsEnabled = ProcessInfo.processInfo.environment["DESKDECK_DIAGNOSTICS"] == "1"
+private func desktopDiagnostic(_ message:String) {if desktopDiagnosticsEnabled {NSLog("DeskDeck diagnostics: %@",message)}}
+
 final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     var stream: SCStream?
     let source: RTCVideoSource
     lazy var capturer = RTCVideoCapturer(delegate: source)
     var onError: ((String)->Void)?
+    var closed=false;var sentFrames=0
     init(source:RTCVideoSource) {self.source=source;super.init()}
-    func start(display:SCDisplay, width:Int=1920, fps:Int=60) async throws {
+    func start(display:SCDisplay) async throws {
+        // The bundled H.264 encoder advertises level 3.1: at most 1280 × 720 at 30 fps.
+        let scale=min(1.0,min(1280.0/Double(display.width),720.0/Double(display.height)))
+        let width=max(2,Int(Double(display.width)*scale/2)*2),height=max(2,Int(Double(display.height)*scale/2)*2),fps=30
         let filter=SCContentFilter(display:display,excludingWindows:[])
-        let c=SCStreamConfiguration();c.width=width;c.height=Int(Double(width)*Double(display.height)/Double(display.width));c.minimumFrameInterval=CMTime(value:1,timescale:CMTimeScale(fps));c.queueDepth=3;c.pixelFormat=kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;c.showsCursor=true;c.capturesAudio=false
+        let c=SCStreamConfiguration();c.width=width;c.height=height;c.minimumFrameInterval=CMTime(value:1,timescale:CMTimeScale(fps));c.queueDepth=3;c.pixelFormat=kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;c.showsCursor=true;c.capturesAudio=false
         let s=SCStream(filter:filter,configuration:c,delegate:self);stream=s
         try s.addStreamOutput(self,type:.screen,sampleHandlerQueue:DispatchQueue(label:"deskdeck.capture",qos:.userInteractive));try await s.startCapture()
+        guard !closed else {try? await s.stopCapture();return}
+        desktopDiagnostic("capture started width=\(width) height=\(height) fps=\(fps) pixelFormat=NV12")
     }
-    func stop() {if let s=stream {Task {try? await s.stopCapture()}};stream=nil}
-    func stream(_ stream:SCStream,didStopWithError error:Error) {onError?(error.localizedDescription)}
+    func stop() {closed=true;if let s=stream {Task {try? await s.stopCapture()}};stream=nil}
+    func stream(_ stream:SCStream,didStopWithError error:Error) {guard !closed else{return};onError?(error.localizedDescription)}
     func stream(_ stream:SCStream,didOutputSampleBuffer sampleBuffer:CMSampleBuffer,of type:SCStreamOutputType) {
-        guard type == .screen, sampleBuffer.isValid,let pixel=CMSampleBufferGetImageBuffer(sampleBuffer),let info=CMSampleBufferGetSampleAttachmentsArray(sampleBuffer,createIfNecessary:false) as? [[SCStreamFrameInfo:Any]],let status=info.first?[.status] as? Int,status==SCFrameStatus.complete.rawValue else{return}
+        guard !closed,type == .screen, sampleBuffer.isValid,let pixel=CMSampleBufferGetImageBuffer(sampleBuffer),let info=CMSampleBufferGetSampleAttachmentsArray(sampleBuffer,createIfNecessary:false) as? [[SCStreamFrameInfo:Any]],let status=info.first?[.status] as? Int,status==SCFrameStatus.complete.rawValue else{return}
         let frame=RTCVideoFrame(buffer:RTCCVPixelBuffer(pixelBuffer:pixel),rotation:._0,timeStampNs:Int64(CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds*1_000_000_000))
         capturer.delegate?.capturer(capturer,didCapture:frame)
+        sentFrames+=1
+        if sentFrames==1 {desktopDiagnostic("capture first frame width=\(CVPixelBufferGetWidth(pixel)) height=\(CVPixelBufferGetHeight(pixel))")}
+        else if sentFrames%90==0 {desktopDiagnostic("capture frames delivered=\(sentFrames)")}
     }
 }
 
@@ -33,9 +45,10 @@ final class DesktopPeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDele
     var state: (String)->Void
     var remoteSet=false;var candidates:[RTCIceCandidate]=[]
     var displays:[SCDisplay]=[];var source:RTCVideoSource!;var closed=false
+    var statisticsTimer:DispatchSourceTimer?
     init(signal:@escaping([String:Any])->Void,state:@escaping(String)->Void) {
         self.signal=signal;self.state=state;super.init()
-        if ProcessInfo.processInfo.environment["DESKDECK_DIAGNOSTICS"] == "1" {
+        if desktopDiagnosticsEnabled {
             let path=NSHomeDirectory()+"/Library/Logs/DeskDeck";try? FileManager.default.createDirectory(atPath:path,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700]);logger=RTCFileLogger(dirPath:path,maxFileSize:1024*1024);logger?.severity = .warning;logger?.start()
         }
         let c=RTCConfiguration();c.sdpSemantics = .unifiedPlan;c.iceServers=[]
@@ -49,6 +62,29 @@ final class DesktopPeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDele
         displays=content.displays;input.bounds=CGDisplayBounds(display.displayID)
         let capture=DesktopCapture(source:source);capture.onError={ [weak self] s in self?.signal(["type":"error","message":s]) };self.capture=capture
         try await capture.start(display:display)
+        guard !closed else {capture.stop();return}
+        if desktopDiagnosticsEnabled {
+            let timer=DispatchSource.makeTimerSource(queue:.main);statisticsTimer=timer
+            timer.schedule(deadline:.now()+3,repeating:3)
+            timer.setEventHandler{[weak self] in self?.logStatistics()};timer.resume()
+        }
+    }
+    private func logStatistics() {
+        guard !closed else{return}
+        pc.statistics{[weak self] report in
+            guard let self=self,!self.closed else{return}
+            var found=false
+            for stat in report.statistics.values where stat.type=="outbound-rtp" {
+                let values=stat.values
+                guard (values["kind"] as? String ?? values["mediaType"] as? String)=="video" else{continue}
+                found=true
+                let fields=["framesEncoded","bytesSent","framesPerSecond"].map{"\($0)=\(values[$0]?.description ?? "unavailable")"}.joined(separator:" ")
+                let codecID=values["codecId"] as? String ?? ""
+                let codec=report.statistics[codecID]?.values["mimeType"] as? String ?? "unavailable"
+                desktopDiagnostic("outbound video \(fields) codec=\(codec)")
+            }
+            if !found {desktopDiagnostic("outbound video stats unavailable")}
+        }
     }
     func receive(_ m:[String:Any]) {
         guard !closed,let type=m["type"] as? String else{return}
@@ -66,7 +102,7 @@ final class DesktopPeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDele
             if remoteSet {pc.add(ice,completionHandler:{_ in})} else {candidates.append(ice)}
         }
     }
-    func stop() {closed=true;capture?.stop();capture=nil;channel?.close();pc?.close();DispatchQueue.main.async {self.input.releaseAll()}}
+    func stop() {guard !closed else{return};closed=true;statisticsTimer?.cancel();statisticsTimer=nil;capture?.stop();capture=nil;channel?.close();pc?.close();logger?.stop();DispatchQueue.main.async {self.input.releaseAll()}}
     func send(_ m:[String:Any]) {guard let d=try? JSONSerialization.data(withJSONObject:m),channel?.readyState == .open else{return};channel?.sendData(RTCDataBuffer(data:d,isBinary:false))}
     func dataChannelDidChangeState(_ dataChannel:RTCDataChannel) {if dataChannel.readyState == .open {send(["type":"displays","displays":displays.map{["id":$0.displayID,"width":$0.width,"height":$0.height]}])}else{DispatchQueue.main.async{self.input.releaseAll()}}}
     func dataChannel(_ dataChannel:RTCDataChannel,didReceiveMessageWith buffer:RTCDataBuffer) {
@@ -78,7 +114,21 @@ final class DesktopPeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDele
         }
     }
     func peerConnection(_ peerConnection:RTCPeerConnection,didGenerate candidate:RTCIceCandidate) {signal(["type":"ice","candidate":["candidate":candidate.sdp,"sdpMid":candidate.sdpMid ?? "0","sdpMLineIndex":candidate.sdpMLineIndex]])}
-    func peerConnection(_ peerConnection:RTCPeerConnection,didChange newState:RTCPeerConnectionState) {state(String(describing:newState));if newState == .disconnected || newState == .failed || newState == .closed {DispatchQueue.main.async{self.input.releaseAll()}}}
+    func peerConnection(_ peerConnection:RTCPeerConnection,didChange newState:RTCPeerConnectionState) {
+        let label:String
+        switch newState {
+        case .new:label="Preparing connection"
+        case .connecting:label="Connecting to headset…"
+        case .connected:label="Headset connected"
+        case .disconnected:label="Headset disconnected"
+        case .failed:label="Connection failed"
+        case .closed:label="Connection closed"
+        @unknown default:label="Connection state unavailable"
+        }
+        desktopDiagnostic("peer state=\(label)")
+        guard !closed else{return};state(label)
+        if newState == .disconnected || newState == .failed || newState == .closed {DispatchQueue.main.async{self.input.releaseAll()}}
+    }
     func peerConnection(_ peerConnection:RTCPeerConnection,didOpen dataChannel:RTCDataChannel) {guard dataChannel.label=="input" else{dataChannel.close();return};channel=dataChannel;dataChannel.delegate=self}
     func peerConnection(_ peerConnection:RTCPeerConnection,didChange stateChanged:RTCSignalingState) {}
     func peerConnection(_ peerConnection:RTCPeerConnection,didAdd stream:RTCMediaStream) {}
